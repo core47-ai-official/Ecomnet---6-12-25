@@ -1,0 +1,231 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.50.2";
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
+
+serve(async (req) => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    console.log('🔄 Starting scheduled courier tracking updates...');
+    
+    const supabase = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    );
+
+    // Get all active dispatches that need tracking
+    const { data: dispatches, error: fetchError } = await supabase
+      .from('dispatches')
+      .select(`
+        id,
+        order_id,
+        tracking_id,
+        courier,
+        courier_id,
+        last_tracking_update
+      `)
+      .not('tracking_id', 'is', null);
+
+    if (fetchError) {
+      console.error('Error fetching dispatches:', fetchError);
+      throw fetchError;
+    }
+
+    console.log(`📦 Found ${dispatches?.length || 0} dispatches to track`);
+
+    const results = {
+      total: dispatches?.length || 0,
+      updated: 0,
+      failed: 0,
+      errors: [] as any[]
+    };
+
+    // Track each dispatch
+    for (const dispatch of dispatches || []) {
+      try {
+        console.log(`🔍 Tracking ${dispatch.courier} - ${dispatch.tracking_id}`);
+        
+        // Call the courier-tracking function
+        const { data: trackingData, error: trackingError } = await supabase.functions.invoke(
+          'courier-tracking',
+          {
+            body: {
+              trackingId: dispatch.tracking_id,
+              courierCode: dispatch.courier
+            }
+          }
+        );
+
+        if (trackingError) {
+          console.error(`Failed to track ${dispatch.tracking_id}:`, trackingError);
+          results.failed++;
+          results.errors.push({
+            dispatch_id: dispatch.id,
+            tracking_id: dispatch.tracking_id,
+            error: trackingError.message
+          });
+          continue;
+        }
+
+        if (trackingData?.success && trackingData?.tracking) {
+          const tracking = trackingData.tracking;
+          
+          // Check if status or location has actually changed from last record
+          const { data: lastRecord } = await supabase
+            .from('courier_tracking_history')
+            .select('status, current_location')
+            .eq('tracking_id', dispatch.tracking_id)
+            .order('checked_at', { ascending: false })
+            .limit(1)
+            .single();
+
+          const statusChanged = !lastRecord || lastRecord.status !== tracking.status;
+          const locationChanged = !lastRecord || lastRecord.current_location !== tracking.currentLocation;
+          const hasChange = statusChanged || locationChanged;
+
+          // Update dispatch's last tracking update timestamp
+          await supabase
+            .from('dispatches')
+            .update({
+              last_tracking_update: new Date().toISOString(),
+              courier_response: tracking.raw
+            })
+            .eq('id', dispatch.id);
+
+          // Only log to activity logs and tracking history if something changed
+          if (hasChange) {
+            const statusDescriptions: Record<string, string> = {
+              'booked': `Order booked with ${dispatch.courier}`,
+              'picked_up': `Package picked up by ${dispatch.courier}`,
+              'in_transit': `Order in transit${tracking.currentLocation ? ` at ${tracking.currentLocation}` : ''}`,
+              'out_for_delivery': `Out for delivery${tracking.currentLocation ? ` in ${tracking.currentLocation}` : ''}`,
+              'delivered': 'Order successfully delivered',
+              'returned': `Order returned by ${dispatch.courier}`,
+              'failed_delivery': 'Delivery attempt failed',
+              'on_hold': 'Shipment on hold'
+            };
+
+            const statusAction = tracking.status.replace(/-/g, '_');
+            const actionDescription = statusDescriptions[tracking.status] || `Status updated: ${tracking.status}`;
+
+            // Log to activity logs only when there's a change (skip if system user doesn't exist)
+            try {
+              await supabase.from('activity_logs').insert({
+                user_id: '00000000-0000-0000-0000-000000000000',
+                entity_type: 'order',
+                entity_id: dispatch.order_id,
+                action: `tracking_${statusAction}`,
+                details: {
+                  description: actionDescription,
+                  courier: dispatch.courier,
+                  tracking_id: dispatch.tracking_id,
+                  status: tracking.status,
+                  location: tracking.currentLocation,
+                  timestamp: new Date().toISOString()
+                }
+              });
+            } catch (activityLogError) {
+              console.warn('Could not log activity (system user may not exist):', activityLogError);
+            }
+
+            // Get courier_id from couriers table if not available on dispatch
+            let courierId = dispatch.courier_id;
+            if (!courierId && dispatch.courier) {
+              const { data: courierData } = await supabase
+                .from('couriers')
+                .select('id')
+                .eq('code', dispatch.courier.toLowerCase())
+                .single();
+              courierId = courierData?.id || null;
+            }
+
+            // Log tracking history only when status or location changes
+            if (courierId) {
+              await supabase
+                .from('courier_tracking_history')
+                .insert({
+                  dispatch_id: dispatch.id,
+                  order_id: dispatch.order_id,
+                  courier_id: courierId,
+                  tracking_id: dispatch.tracking_id,
+                  status: tracking.status,
+                  current_location: tracking.currentLocation,
+                  raw_response: tracking.raw,
+                  checked_at: new Date().toISOString()
+                });
+            } else {
+              console.warn(`Skipping tracking history for ${dispatch.tracking_id} - no courier_id found`);
+            }
+
+            console.log(`✅ Updated ${dispatch.tracking_id}: ${tracking.status}${tracking.currentLocation ? ` at ${tracking.currentLocation}` : ''}`);
+          } else {
+            console.log(`⏭️ No change for ${dispatch.tracking_id}: ${tracking.status}`);
+          }
+
+          // Update order status if delivered OR returned
+          if (tracking.status === 'delivered') {
+            await supabase
+              .from('orders')
+              .update({
+                status: 'delivered',
+                delivered_at: new Date().toISOString()
+              })
+              .eq('id', dispatch.order_id);
+            console.log(`📦 Order ${dispatch.order_id} marked as delivered`);
+          } else if (tracking.status === 'returned') {
+            await supabase
+              .from('orders')
+              .update({
+                status: 'returned',
+                returned_at: new Date().toISOString()
+              })
+              .eq('id', dispatch.order_id);
+            console.log(`↩️ Order ${dispatch.order_id} marked as returned`);
+          }
+
+          results.updated++;
+        }
+      } catch (error: any) {
+        console.error(`Error processing dispatch ${dispatch.id}:`, error);
+        results.failed++;
+        results.errors.push({
+          dispatch_id: dispatch.id,
+          tracking_id: dispatch.tracking_id,
+          error: error.message
+        });
+      }
+    }
+
+    console.log('✨ Scheduled tracking complete:', results);
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        results
+      }),
+      {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      }
+    );
+
+  } catch (error: any) {
+    console.error('Error in scheduled-courier-tracking:', error);
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: error.message
+      }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      }
+    );
+  }
+});
